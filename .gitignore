@@ -1,0 +1,6 @@
+node_modules/
+.env
+config.json
+reservedServers.json
+*.log
+.DS_Store
