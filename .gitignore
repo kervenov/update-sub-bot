@@ -1,6 +1,20 @@
+# dependencies
 node_modules/
+
+# secrets / runtime config
 .env
+
+# bot-generated state (mutated at runtime by configStore.js / storage.js)
 config.json
 reservedServers.json
+
+# atomic-write artifacts left behind if the process crashes mid-write
+# (configStore.js:32, storage.js:28 write to <file>.tmp before rename)
+*.tmp
+
+# logs
 *.log
+
+# OS metadata
 .DS_Store
+Thumbs.db

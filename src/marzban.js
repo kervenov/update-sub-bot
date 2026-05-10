@@ -9,9 +9,119 @@ export class MarzbanCredentialsMissingError extends Error {
   }
 }
 
+// Auth rejected by Marzban (HTTP 401/403). User must re-enter credentials.
+export class MarzbanAuthError extends Error {
+  constructor(statusCode, body) {
+    super(`Marzban auth rejected (${statusCode}): ${truncate(body)}`);
+    this.name = 'MarzbanAuthError';
+    this.statusCode = statusCode;
+  }
+}
+
+// Network/transport problem or 5xx — Marzban itself is unreachable or sick.
+// Callers (rotation flow) should treat this as transient and surface it
+// distinctly from "credentials wrong" or "validation error".
+export class MarzbanUnavailableError extends Error {
+  constructor(message, { cause, statusCode } = {}) {
+    super(message);
+    this.name = 'MarzbanUnavailableError';
+    if (cause) this.cause = cause;
+    if (statusCode) this.statusCode = statusCode;
+  }
+}
+
 // kept exported for callers that used to flush the cache; now a no-op since
 // every getToken() call hits /api/admin/token afresh.
 export function invalidateToken() {}
+
+// --- Resilience layer ---------------------------------------------------
+// Marzban can be flaky (TM blocks, panel restarts, slow upstream). Every
+// outbound call goes through this wrapper so timeouts + transient retries
+// are handled in exactly one place.
+
+const REQUEST_TIMEOUT_MS = 15_000;
+const MAX_ATTEMPTS = 3;
+const RETRY_BACKOFF_MS = [500, 1500];
+
+const RETRYABLE_NET_CODES = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ETIMEDOUT',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'EPIPE',
+  'UND_ERR_SOCKET',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
+]);
+
+function isRetryableNetworkError(err) {
+  if (!err) return false;
+  const code = err.code || err.cause?.code;
+  if (code && RETRYABLE_NET_CODES.has(code)) return true;
+  if (err.name === 'AbortError') return true;
+  return false;
+}
+
+function isRetryableStatus(status) {
+  return status === 408 || status === 429 || (status >= 500 && status <= 599);
+}
+
+function truncate(text, max = 200) {
+  if (!text) return '';
+  const s = String(text);
+  return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// Single network attempt with hard timeout. Returns { statusCode, text }.
+async function attemptRequest(url, init) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const { statusCode, body } = await request(url, {
+      ...init,
+      signal: ac.signal,
+      headersTimeout: REQUEST_TIMEOUT_MS,
+      bodyTimeout: REQUEST_TIMEOUT_MS,
+    });
+    const text = await body.text();
+    return { statusCode, text };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Performs an HTTP call with retry-on-transient and uniform error mapping.
+// Returns { statusCode, text } when the server responds (any status). Throws
+// MarzbanUnavailableError only when the panel never gave us a clean answer
+// after all retries.
+async function resilientRequest(url, init, label) {
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await attemptRequest(url, init);
+      if (isRetryableStatus(res.statusCode) && attempt < MAX_ATTEMPTS) {
+        await sleep(RETRY_BACKOFF_MS[attempt - 1] ?? 1500);
+        continue;
+      }
+      return res;
+    } catch (err) {
+      lastErr = err;
+      if (!isRetryableNetworkError(err) || attempt === MAX_ATTEMPTS) break;
+      await sleep(RETRY_BACKOFF_MS[attempt - 1] ?? 1500);
+    }
+  }
+  const reason = lastErr?.code || lastErr?.cause?.code || lastErr?.name || lastErr?.message || 'unknown';
+  throw new MarzbanUnavailableError(
+    `Marzban unreachable on ${label} after ${MAX_ATTEMPTS} attempts (${reason})`,
+    { cause: lastErr },
+  );
+}
 
 async function getToken() {
   const { username, password } = await getMarzbanCredentials();
@@ -23,33 +133,76 @@ async function getToken() {
     grant_type: 'password',
   }).toString();
 
-  const { statusCode, body: resBody } = await request(`${config.marzban.baseUrl}/api/admin/token`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body,
-  });
-  const text = await resBody.text();
-  if (statusCode !== 200) {
-    throw new Error(`marzban auth failed (${statusCode}): ${text}`);
+  const { statusCode, text } = await resilientRequest(
+    `${config.marzban.baseUrl}/api/admin/token`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body,
+    },
+    '/api/admin/token',
+  );
+
+  if (statusCode === 401 || statusCode === 403) {
+    throw new MarzbanAuthError(statusCode, text);
   }
-  return JSON.parse(text).access_token;
+  if (statusCode !== 200) {
+    // anything else after retries (e.g. a final 5xx that exhausted retries)
+    // is treated as the panel being unhealthy.
+    throw new MarzbanUnavailableError(
+      `Marzban auth endpoint returned ${statusCode}: ${truncate(text)}`,
+      { statusCode },
+    );
+  }
+
+  try {
+    return JSON.parse(text).access_token;
+  } catch (err) {
+    throw new MarzbanUnavailableError(
+      `Marzban auth response was not valid JSON: ${truncate(text)}`,
+      { cause: err },
+    );
+  }
 }
 
 async function authedRequest(pathname, init = {}) {
   const token = await getToken();
-  const { statusCode, body } = await request(`${config.marzban.baseUrl}${pathname}`, {
-    ...init,
-    headers: {
-      ...(init.headers || {}),
-      authorization: `Bearer ${token}`,
-      accept: 'application/json',
+  const { statusCode, text } = await resilientRequest(
+    `${config.marzban.baseUrl}${pathname}`,
+    {
+      ...init,
+      headers: {
+        ...(init.headers || {}),
+        authorization: `Bearer ${token}`,
+        accept: 'application/json',
+      },
     },
-  });
-  const text = await body.text();
-  if (statusCode >= 400) {
-    throw new Error(`marzban ${statusCode} on ${pathname}: ${text}`);
+    pathname,
+  );
+
+  if (statusCode === 401 || statusCode === 403) {
+    throw new MarzbanAuthError(statusCode, text);
   }
-  return text ? JSON.parse(text) : null;
+  if (statusCode >= 500) {
+    throw new MarzbanUnavailableError(
+      `Marzban ${statusCode} on ${pathname}: ${truncate(text)}`,
+      { statusCode },
+    );
+  }
+  if (statusCode >= 400) {
+    // 4xx other than auth — request shape problem, surface verbatim.
+    throw new Error(`marzban ${statusCode} on ${pathname}: ${truncate(text)}`);
+  }
+
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    throw new MarzbanUnavailableError(
+      `Marzban returned non-JSON on ${pathname}: ${truncate(text)}`,
+      { cause: err },
+    );
+  }
 }
 
 export async function testCredentials() {

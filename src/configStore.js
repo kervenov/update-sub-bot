@@ -9,6 +9,7 @@ let writeQueue = Promise.resolve();
 
 const DEFAULT = {
   marzban: { username: '', password: '' },
+  autoRotate: true,
 };
 
 async function readRaw() {
@@ -20,6 +21,7 @@ async function readRaw() {
         username: typeof json?.marzban?.username === 'string' ? json.marzban.username : '',
         password: typeof json?.marzban?.password === 'string' ? json.marzban.password : '',
       },
+      autoRotate: typeof json?.autoRotate === 'boolean' ? json.autoRotate : true,
     };
   } catch (err) {
     if (err.code === 'ENOENT') return structuredClone(DEFAULT);
@@ -59,4 +61,18 @@ export async function clearMarzbanCredentials() {
 export async function hasMarzbanCredentials() {
   const { username, password } = await getMarzbanCredentials();
   return Boolean(username && password);
+}
+
+export async function getAutoRotate() {
+  const data = await readRaw();
+  return data.autoRotate;
+}
+
+export async function setAutoRotate(enabled) {
+  return serialise(async () => {
+    const data = await readRaw();
+    data.autoRotate = Boolean(enabled);
+    await writeRaw(data);
+    return data.autoRotate;
+  });
 }

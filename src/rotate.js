@@ -1,5 +1,10 @@
 import * as storage from './storage.js';
 import * as marzban from './marzban.js';
+import {
+  MarzbanCredentialsMissingError,
+  MarzbanAuthError,
+  MarzbanUnavailableError,
+} from './marzban.js';
 
 // One rotation cycle:
 //   1. pop one IP from each reserve pool (forward + CDN)
@@ -52,8 +57,21 @@ export async function rotate({ trigger, notifyAdmins }) {
   } catch (err) {
     await storage.addIp('forward', newForwardIp);
     await storage.addIp('CDN', newCdnIp);
+
+    let prefix = '❌ rotation failed';
+    if (err instanceof MarzbanUnavailableError) {
+      prefix = '⛔ Marzban panel unreachable, rotation aborted';
+      err.code = err.code || 'MARZBAN_UNAVAILABLE';
+    } else if (err instanceof MarzbanAuthError) {
+      prefix = '🔑 Marzban rejected credentials, rotation aborted';
+      err.code = err.code || 'MARZBAN_AUTH';
+    } else if (err instanceof MarzbanCredentialsMissingError) {
+      prefix = '🔧 Marzban credentials not set, rotation aborted';
+      err.code = err.code || 'MARZBAN_CREDS_MISSING';
+    }
+
     await notifyAdmins(
-      `❌ rotation failed (${trigger}) — ${err.message}\nReturned ${newForwardIp} (forward) and ${newCdnIp} (CDN) to pools.`,
+      `${prefix} (${trigger}) — ${err.message}\nReturned ${newForwardIp} (forward) and ${newCdnIp} (CDN) to pools.`,
     );
     throw err;
   }

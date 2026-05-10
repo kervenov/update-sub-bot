@@ -4,6 +4,7 @@ import * as storage from './storage.js';
 import * as configStore from './configStore.js';
 import * as marzban from './marzban.js';
 import { rotate } from './rotate.js';
+import { makeErrorReporter } from './notify.js';
 
 const IPV4 = /^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$/;
 
@@ -19,13 +20,24 @@ const BTN = {
   cancel: '❌ Cancel',
 };
 
-const mainKeyboard = Markup.keyboard([
-  [BTN.manualUpdate],
-  [BTN.list, BTN.marzban],
-  [BTN.addCdn, BTN.addFwd],
-  [BTN.rmCdn, BTN.rmFwd],
-  [BTN.setMarzban],
-]).resize();
+const STATUS_ON = '🟢 Auto: ON';
+const STATUS_OFF = '🔴 Auto: OFF';
+const STATUS_RE = /^(🟢 Auto: ON|🔴 Auto: OFF)$/;
+
+function statusLabel(enabled) {
+  return enabled ? STATUS_ON : STATUS_OFF;
+}
+
+async function mainKeyboard() {
+  const enabled = await configStore.getAutoRotate();
+  return Markup.keyboard([
+    [statusLabel(enabled), BTN.manualUpdate],
+    [BTN.list, BTN.marzban],
+    [BTN.addCdn, BTN.addFwd],
+    [BTN.rmCdn, BTN.rmFwd],
+    [BTN.setMarzban],
+  ]).resize();
+}
 
 const cancelKeyboard = Markup.keyboard([[BTN.cancel]]).resize();
 
@@ -45,19 +57,19 @@ function renderPool(data) {
 
 async function showList(ctx) {
   const data = await storage.getAll();
-  await ctx.replyWithMarkdownV2(renderPool(data), mainKeyboard);
+  await ctx.replyWithMarkdownV2(renderPool(data), await mainKeyboard());
 }
 
 async function showMarzbanStatus(ctx) {
   const { username } = await configStore.getMarzbanCredentials();
   if (!username) {
-    return ctx.reply('Marzban credentials not set. Tap "🔧 Set Marzban" to configure.', mainKeyboard);
+    return ctx.reply('Marzban credentials not set. Tap "🔧 Set Marzban" to configure.', await mainKeyboard());
   }
   try {
     await marzban.testCredentials();
-    await ctx.reply(`✅ Marzban login OK (user: ${username})\nURL: ${config.marzban.baseUrl}`, mainKeyboard);
+    await ctx.reply(`✅ Marzban login OK (user: ${username})\nURL: ${config.marzban.baseUrl}`, await mainKeyboard());
   } catch (err) {
-    await ctx.reply(`❌ Marzban login failed for ${username}: ${err.message}`, mainKeyboard);
+    await ctx.reply(`❌ Marzban login failed for ${username}: ${err.message}`, await mainKeyboard());
   }
 }
 
@@ -86,14 +98,14 @@ async function applyAdd(ctx, type, ips) {
   if (added.length) lines.push(`✅ added to ${type}:\n${added.map((ip) => `• ${ip}`).join('\n')}`);
   if (dup.length) lines.push(`↩️ already in ${type}:\n${dup.map((ip) => `• ${ip}`).join('\n')}`);
   lines.push(`pool size: ${lastPool.length}`);
-  await ctx.reply(lines.join('\n\n'), mainKeyboard);
+  await ctx.reply(lines.join('\n\n'), await mainKeyboard());
 }
 
 async function applyRemove(ctx, type, ip) {
   const { removed, pool } = await storage.removeIp(type, ip);
   await ctx.reply(
     removed ? `removed ${ip} from ${type}. pool size: ${pool.length}` : `${ip} not in ${type} pool`,
-    mainKeyboard,
+    await mainKeyboard(),
   );
 }
 
@@ -103,9 +115,9 @@ async function applySetMarzban(ctx, username, password) {
   marzban.invalidateToken();
   try {
     await marzban.testCredentials();
-    await ctx.reply(`✅ Marzban credentials saved and verified (user: ${username}).`, mainKeyboard);
+    await ctx.reply(`✅ Marzban credentials saved and verified (user: ${username}).`, await mainKeyboard());
   } catch (err) {
-    await ctx.reply(`⚠️ Saved credentials but login test failed: ${err.message}`, mainKeyboard);
+    await ctx.reply(`⚠️ Saved credentials but login test failed: ${err.message}`, await mainKeyboard());
   }
 }
 
@@ -124,22 +136,35 @@ export function createBot() {
     return next();
   });
 
-  bot.start((ctx) =>
+  bot.start(async (ctx) =>
     ctx.reply(
       [
         'update-subscription-bot ready',
         '',
         'Use the keyboard below to manage reserve pools and Marzban credentials.',
       ].join('\n'),
-      mainKeyboard,
+      await mainKeyboard(),
     ),
   );
 
   // ---- Buttons ----
 
+  bot.hears(STATUS_RE, async (ctx) => {
+    pending.delete(ctx.chat.id);
+    const current = await configStore.getAutoRotate();
+    const next = !current;
+    await configStore.setAutoRotate(next);
+    await ctx.reply(
+      next
+        ? '🟢 Auto-rotation: ON\nIncoming block alerts will trigger automatic rotation.'
+        : '🔴 Auto-rotation: OFF\nIncoming block alerts will be reported to admins but NOT auto-rotated.\nUse 🔄 Manual Update when needed.',
+      await mainKeyboard(),
+    );
+  });
+
   bot.hears(BTN.manualUpdate, async (ctx) => {
     pending.delete(ctx.chat.id);
-    await ctx.reply('🔄 Triggering manual rotation...', mainKeyboard);
+    await ctx.reply('🔄 Triggering manual rotation...', await mainKeyboard());
     try {
       await rotate({
         trigger: `manual update by chat ${ctx.chat.id}`,
@@ -197,7 +222,7 @@ export function createBot() {
 
   bot.hears(BTN.cancel, async (ctx) => {
     pending.delete(ctx.chat.id);
-    await ctx.reply('Cancelled.', mainKeyboard);
+    await ctx.reply('Cancelled.', await mainKeyboard());
   });
 
   // ---- Slash commands (still work as fallback) ----
@@ -282,8 +307,11 @@ export function createBot() {
     }
   });
 
+  const reportError = makeErrorReporter(notifyAdmins);
+
   bot.catch((err, ctx) => {
     console.error('[bot] error in handler', err);
+    reportError('bot/handler', err);
     ctx.reply('internal error — see server logs').catch(() => {});
   });
 
@@ -302,5 +330,7 @@ export function createBot() {
     );
   }
 
-  return { bot, notifyAdmins };
+  const reportError = makeErrorReporter(notifyAdmins);
+
+  return { bot, notifyAdmins, reportError };
 }
