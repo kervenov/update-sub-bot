@@ -330,7 +330,5 @@ export function createBot() {
     );
   }
 
-  const reportError = makeErrorReporter(notifyAdmins);
-
   return { bot, notifyAdmins, reportError };
 }
