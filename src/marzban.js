@@ -242,6 +242,24 @@ export async function findHostByAddress(address) {
   return null;
 }
 
+// True if `address` matches at least one ENABLED SHADOWSOCKS-* host in
+// Marzban. Used by /alert/blocked to reject alerts coming from forward-VPS
+// daemons whose IP is no longer the rotated-in active forward (e.g. a stale
+// daemon still running on a previously-replaced VPS).
+export async function isActiveShadowsocksAddress(address) {
+  if (!address) return false;
+  const all = await listHosts();
+  for (const [tag, hosts] of Object.entries(all)) {
+    if (!tag.startsWith('SHADOWSOCKS-')) continue;
+    if (!Array.isArray(hosts)) continue;
+    for (const h of hosts) {
+      if (h?.is_disabled === true) continue;
+      if (h?.address === address) return true;
+    }
+  }
+  return false;
+}
+
 // Rotate every enabled host's `address` field for the targeted inbounds:
 //   SHADOWSOCKS-* (any inbound tag starting with "SHADOWSOCKS-") → newForwardIp
 //   VLESS WS                                                     → newCdnIp

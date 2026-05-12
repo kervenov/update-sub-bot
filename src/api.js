@@ -3,6 +3,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { config } from './config.js';
 import { rotate } from './rotate.js';
 import * as configStore from './configStore.js';
+import * as marzban from './marzban.js';
 
 const IPV4 = /^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$/;
 
@@ -68,6 +69,39 @@ export function createApi({ notifyAdmins, reportError }) {
     console.log(
       `[api] alert from ${currentIp || 'unknown'}${reason ? ` — ${reason}` : ''}`,
     );
+
+    // Stale-daemon guard: only honour alerts whose currentIp is the address
+    // of an ENABLED SHADOWSOCKS-* host in Marzban. A leftover daemon on a
+    // forward-VPS that was already rotated out would otherwise trigger a
+    // second (wrong) rotation.
+    let isActiveForward = false;
+    try {
+      isActiveForward = await marzban.isActiveShadowsocksAddress(currentIp);
+    } catch (err) {
+      // Cannot verify (panel unreachable / creds wrong). Fail safe: notify
+      // admins and refuse to rotate until we can confirm the alert is real.
+      console.error('[api] marzban check failed (stale-daemon guard)', err);
+      report('api/marzban.isActiveShadowsocksAddress', err);
+      try {
+        await notifyAdmins(
+          [
+            `⚠️ Alert from ${currentIp || 'unknown'}${reason ? ` (${reason})` : ''}`,
+            `Cannot verify whether this is the active forward IP — Marzban: ${err.message}`,
+            `Not auto-rotating. Fix the panel, then use 🔄 Manual Update if rotation is still needed.`,
+          ].join('\n'),
+        );
+      } catch (e) {
+        console.error('[api] notifyAdmins failed (marzban-down path)', e);
+      }
+      return res.status(503).json({ error: 'marzban check failed' });
+    }
+
+    if (!isActiveForward) {
+      console.log(
+        `[api] alert from ${currentIp || 'unknown'} ignored — not the active Shadowsocks forward IP`,
+      );
+      return res.json({ ok: true, skipped: 'not-active-forward-ip' });
+    }
 
     let autoOn;
     try {
