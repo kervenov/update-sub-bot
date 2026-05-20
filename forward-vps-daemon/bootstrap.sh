@@ -123,7 +123,7 @@ cat > /usr/local/sbin/tm-block-watch.sh <<DAEMON
 #   - Server sees an opened-then-closed socket with zero bytes transferred
 #   - Apache/nginx/Cloudflare etc. do NOT log abandoned pre-request sockets
 #   - Probe order is SHUFFLED per round (Fisher-Yates) so no single host
-#     bears the full probe load → ~33 % of rounds each on average
+#     bears the full probe load → ~33 % of rounds each on average (3 hosts)
 #   - 20 % of rounds probe only ONE host → average ~2 conn/host/min,
 #     invisible noise for any high-traffic site
 #   - ±5 s jitter on the sleep interval so the cadence is not periodic
@@ -136,7 +136,7 @@ API_URL="${API_URL}"
 API_TOKEN="${API_TOKEN}"
 
 # ---- probe config ----
-PROBE_HOSTS=(turkmenportal.com localspeed.telecom.tm speedtest.telecom.tm)
+PROBE_HOSTS=(ynamdar.com 100haryt.com telecom.tm)
 PROBE_PORT=443
 PROBE_TIMEOUT=3       # seconds per TCP-connect attempt
 TICK=10               # base interval between rounds (jittered ±2 s)
